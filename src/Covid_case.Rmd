@@ -1,0 +1,394 @@
+---
+title: "Covid_Case"
+author: Tsz Fung Wong
+date: February 25, 2022
+output: 
+  github_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(DataExplorer)
+library(ggplot2)
+library(gt)
+library(lubridate)
+
+#Working directory for .RMD
+knitr::opts_knit$set(echo = TRUE,
+root.dir = rprojroot::find_rstudio_root_file())
+#Controlling figure output in markdown
+knitr::opts_chunk$set(
+# fig.height = 4
+fig.width = 6,
+# fig.asp = .5,
+out.width = "90%",
+# out.height =
+fig.align = "center",
+cache = FALSE,
+echo = TRUE
+)
+#Set Theme for ggplot2
+theme_set(theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom"))
+#Set Scientific notation output for knitr
+options(scipen = 999)
+options(digits = 4)
+```
+
+```{r message = FALSE, warning = FALSE}
+file_dir = "./data/"
+covid_file_list = intersect( 
+                  list.files(file_dir, pattern = c("covid")),
+                  list.files(file_dir, pattern = c(".csv"))
+                  )
+
+covid_file_list = covid_file_list[!str_detect(covid_file_list, "aggregate")]
+
+#read all files with names include continent 
+covid_aggr = tibble(file_dir   = "./data/", #path for read csv
+          file_list  = covid_file_list, #list of filename for read csv
+          data_name  = str_split(file_list, "_", 2) %>% #extract continent information 
+            map_chr(2), 
+          file_paths = str_c(file_dir, file_list) # full filepath
+          ) %>%
+  mutate(
+    data = map(.x = file_paths, ~read_csv(.x)),
+    continent = str_remove(data_name, ".csv")
+  ) %>%
+  dplyr::select(!contains(c("file", "name"))) %>% #retain only data
+  unnest(data) %>%
+  janitor::clean_names() 
+  
+#cleaning variables
+covid_aggr = covid_aggr %>%
+  mutate(
+    date = ymd(date),
+    continent = as.factor(continent), 
+    country = as.factor(location),
+    case_0 = if_else(is.na(new_cases), 0, new_cases), #NA = 0 temporarily for cumsum
+    death_0 = if_else(is.na(new_deaths), 0, new_deaths),
+    month = month(date, label = TRUE, abbr = TRUE),
+    dow = wday(date, 
+               label = TRUE, 
+               abbr = FALSE, 
+               week_start = getOption("lubridate.week.start", 1)) #start from Monday
+    ) %>%
+  select(-location) %>%
+  nest(-country) %>%
+  mutate(case_tot = map_dbl(.x = data,
+                            ~max(cumsum(.x$case_0))),
+         death_tot = map_dbl(.x = data,
+                             ~max(cumsum(.x$death_0))), #sum over case and death number per country
+         ) %>%
+  unnest(data) %>%
+  select(-c(case_0, death_0)) #remove variables for calculating case_tot and death_tot
+
+```
+
+# Data set Description 
+Covid dataset is extracted from  Our World In Data's Github. There are total of `r nrow(covid_aggr)` observations of `r ncol(covid_aggr)` variables. The dataset recorded the number of confirmed new cases and deaths as new_cases and new_deaths. New_cases_smoothed and new_deaths are the corresponding 7-day smoothed average per 1,000,000 people. "NA" values indicate the data correction for report of negative daily change confirmed cases & deaths. And missing values is propagated to the smoothed average until data leave rolling window. Case_tot and death_tot are the total counts of cases and deaths for each continents. 
+
+Continent and location describe the geographical characteristics of the observation. Date, month and dow describe the time when a observation is recorded, with month and dow indicating the month and weekday it belongs to respectively. Population, population_density, median_age describe the demographic information for each location. population_density is measured by the number of people divided by land area, measured in square kilometers.  gpd_per_capita measures Gross domestic product at purchasing power parity (constant 2011 international dollars). Diabetes_prevalence is the percentage  of population aged 20 to 79, measured in 2017. human_development_index is a composite index measuring average achievement in three basic dimensions of human development—a long and healthy life, knowledge and a decent standard of living. 
+
+
+
+# Summarise total number of cases and deaths by continent
+```{r message = FALSE, warning = FALSE}
+#function for calculating total cases and death
+#case_tot/ death_tot as desired input
+cal_sum <- function(N, na.rm = TRUE){ 
+  N[is.na(N)] = 0
+  tot = sum(unique(N)) #eliminate repeated observations from same location
+  return(tot)
+}
+
+# 
+covid_continent.df =
+covid_aggr %>%
+  group_by(continent) %>%  #summary statistics by continent
+  summarise(
+    across(c(new_cases, new_deaths, case_tot, death_tot), 
+           .f = list(mean = mean, 
+                      SD = sd,
+                     sum = cal_sum),
+            na.rm = TRUE,
+           .names = "{.col}_{.fn}"
+           )
+    ) %>% 
+  select(c(continent, new_cases_mean, new_cases_SD, new_deaths_mean, new_deaths_SD, case_tot_sum, death_tot_sum)) %>% #eliminate unwanted output
+  mutate(
+    continent = str_replace(continent, "_", " ") %>% #cater continent names with 2 character
+      str_to_title() %>%
+      as.factor() %>%
+  fct_reorder2(death_tot_sum, case_tot_sum, .desc = FALSE)) %>% #order by total number of death and case
+  arrange(desc(death_tot_sum)) %>%
+  gt() %>% 
+  tab_spanner( # Case columns
+    label = "Cases",
+     columns = contains("case")
+  ) %>% 
+  tab_spanner(
+    label = "Death", #Death columns 
+     columns = contains("death")
+  ) %>%
+  fmt_number(columns = c(new_deaths_mean, new_deaths_SD), decimals = 1) %>% # format cell vales, sci. int = 1 
+  fmt_number(columns = c(death_tot_sum, case_tot_sum), suffixing =  TRUE) %>% #M,K suffix 
+  tab_header("COVID-19 Case & Death Aggregate Summary by Continent") %>%
+  data_color(columns = death_tot_sum, 
+             colors = scales::col_numeric(
+               palette = c("white", 'purple'), 
+               domain = c(min(death_tot_sum), max(death_tot_sum)))
+             ) %>%
+  data_color(columns = case_tot_sum, 
+             colors = scales::col_numeric(
+               palette = c("white", "purple"),
+               domain = c(min(case_tot_sum), max(case_tot_sum)))
+             )
+
+#format tables
+covid_continent.df %>%  
+  tab_source_note(
+    source_note = "Data from Jan. 1, 2020 - Feb. 25, 2022, extracted from Our World In Data's Github") %>%
+  summary_rows( #add row sum
+               columns = contains("sum"),
+               fns = list("Global Total" = "sum"), 
+               suffixing =  TRUE) %>%
+  cols_label(continent = "Continent" , #change column names 
+              new_cases_mean = "Daily Average",
+              new_cases_SD = "Daily SD", 
+             case_tot_sum = "Total",
+              new_deaths_mean = "Daily Average",
+             new_deaths_SD = "Daily SD" , 
+             death_tot_sum = "Total") %>%
+  as_raw_html()
+
+  
+  
+```
+
+# Cases and death of top 5 countries per continent
+```{r message = FALSE, warning = FALSE}
+top_5  = covid_aggr %>% #extract top countries in each continent
+  nest(-c(continent, country)) %>%
+  mutate(
+    N = map(.x = data, 
+            ~.x %>%
+              pull(new_cases) %>%
+              sum(na.rm = TRUE))
+    ) %>%
+  select(-data) %>%
+  unnest() %>%
+  arrange(continent, desc(N)) %>%
+  group_by(continent) %>%
+  slice(1:5) %>% 
+  pull(country)
+
+covid_country = covid_aggr %>%
+  filter(country %in% top_5) %>% #select only countries interested
+  nest(-country) %>% 
+  mutate( #summary statistics for case/ death
+    Summary = map(.x = data,
+                  ~.x %>% #for each country
+                     mutate( 
+                       across(c(new_cases, new_deaths, case_tot, death_tot),
+                              .f = list(mean = mean,
+                                        SD = sd,
+                                        sum = sum),
+                              na.rm = TRUE,
+                              .names = "{.col}_{.fn}"
+                              )
+                       )
+                  )
+    ) %>%
+  unnest(Summary) %>%
+  select(-data) %>%
+  select(c(country, continent, new_cases_mean, new_cases_SD, new_deaths_mean, new_deaths_SD, case_tot_sum, death_tot_sum)) %>% #eliminate unwanted output
+  distinct() %>% #repeated values due to different dates
+  mutate(
+    continent = str_replace(continent, "_", " ") %>% 
+      str_to_title() %>%
+      as.factor(),
+    country = country %>%
+  fct_reorder2(death_tot_sum, case_tot_sum, .desc = FALSE)) %>% #order by total number of death and case
+  rename(Country = country) %>%
+  arrange(desc(death_tot_sum)) %>%
+  group_by(continent) %>%
+  gt()
+
+
+#format table 
+covid_country %>% tab_spanner(
+    label = "Cases",
+     columns = contains("case")
+  ) %>% 
+  tab_spanner(
+    label = "Death",
+     columns = contains("death")
+  ) %>%
+  fmt_number(columns = c(new_deaths_mean, new_deaths_SD), decimals = 1) %>% 
+  fmt_number(columns = c(death_tot_sum, case_tot_sum), suffixing =  TRUE) %>%
+  tab_header("COVID-19 Case & Death in Top 5 Countries by Continent Summary") %>%
+  data_color(columns = death_tot_sum, #cell color 
+             colors = scales::col_numeric(
+               palette = c("white", 'purple'), 
+               domain = c(min(death_tot_sum), max(death_tot_sum)))
+             ) %>%
+  data_color(columns = case_tot_sum, 
+             colors = scales::col_numeric(
+               palette = c("white", "purple"),
+               domain = c(min(case_tot_sum), max(case_tot_sum)))
+             ) %>%  
+  tab_source_note(
+    source_note = "Data from Jan. 1, 2020 - Feb. 25, 2022, extracted from Our World In Data's Github") %>%
+  summary_rows(
+               columns = contains("sum"),
+               fns = list("Continent Total" = "sum"), 
+               suffixing =  TRUE) %>%
+  summary_rows(
+               columns = contains("sum"),
+               groups = TRUE,
+               fns = list("Top 5 Countries Total" = "sum"), 
+               suffixing =  TRUE) %>%
+  cols_label(continent = "Continent" ,
+              new_cases_mean = "Daily Average",
+              new_cases_SD = "Daily SD", 
+             case_tot_sum = "Total",
+              new_deaths_mean = "Daily Average",
+             new_deaths_SD = "Daily SD" , 
+             death_tot_sum = "Total") %>%
+  as_raw_html()
+
+
+```
+
+# Global COVID-19 from 2020 - Present: Temporal Trends
+## Globally, on which days of the week are most cases and deaths reported, respectively?
+```{r message = FALSE, warning = FALSE}
+covid_wday.df = covid_aggr %>%
+  group_by(dow) %>% 
+  summarise( #week day summary
+    across(c(new_cases, new_deaths),
+    .f = list(sum = sum),
+    na.rm = TRUE, 
+    .names = "{.col}_{.fn}"
+    )
+  ) %>%
+  rename(
+         "Cases" = new_cases_sum,
+         "Death" = new_deaths_sum) %>%
+  gt() %>%
+  tab_style( #formate cell color
+    style = list( 
+      cell_fill(color = "pink")),
+      locations = list(
+        cells_body(
+                   columns = c(Cases),
+                   rows  = which.max(Cases) #color the maximum cell
+                   ),
+        cells_body(
+                   columns = c(Death),
+                   rows  = which.max(Death) #color the maximum cell
+                   )
+        )
+  ) %>%
+  tab_source_note(
+    source_note = "Data from Jan. 1, 2020 - Feb. 25, 2022, extracted from Our World In Data's Github") %>%
+  fmt_number(columns = c(Cases, Death), suffixing =  TRUE) 
+
+#Format table
+covid_wday.df %>%
+  summary_rows(columns = c(Cases, Death),
+               fns = list("Total" = "sum"), 
+               suffixing =  TRUE) %>%
+  cols_label(dow = "Day of Week") %>%
+  as_raw_html()
+
+
+
+```
+
+## Global “rolling-average” plots
+```{r message = FALSE, warning = FALSE}
+covid_trend.df = covid_aggr %>%
+  nest(-date) %>%
+  mutate(
+    Summary = map(.x = data, #summary statistics across case/ death
+                         ~.x %>%
+                           mutate(
+                             across(c(new_cases, new_deaths, new_cases_smoothed, new_deaths_smoothed),
+                                    .f = list(sum = sum),
+                                    na.rm = TRUE,
+                                    .names = "{.col}_{.fn}"
+                                    )
+                             )
+                  )
+    ) %>%
+  unnest() %>%
+  select(c(date, contains("sum"))) %>% #extract relevant columns
+  distinct() %>%
+  rename(Date = date, 
+         Cases = new_cases_sum,
+         Deaths = new_deaths_sum)
+
+
+covid_trend.df %>% #plot for covid case
+  ggplot(aes(x = Date, color = Cases)) +
+  geom_col(
+    aes(y = Cases),
+    alpha = 0.02) +
+  scale_color_gradient(low  ="orange", #indicate intensity of values by color
+                       high = "red",
+                       n.breaks = 3,
+                       labels = c("0", "2M", "4M"),
+                       limits = c(0, 4*10^6)
+                       ) +
+  geom_smooth(
+    aes(y = new_cases_smoothed_sum, fill = ""),
+    alpha = 0.8,
+    span = 0.05) +
+  guides(fill = guide_legend(title = "7-day Average")) + #legend
+  labs(
+    x = "Date (Month,Year)",
+    title = "Global Trend of Covid-19 Cases") +
+  scale_x_date( 
+    date_breaks = "3 month",  
+    date_labels = "%b %y" 
+    ) +
+   theme(axis.text.x = element_text(angle = 45,
+                                    vjust = 1.24,
+                                    hjust = 1.2,
+                                    size  = 10),
+          axis.text.y = element_text(size  = 10)) +
+  scale_y_continuous(labels = scales::label_number_si()) #y-axis in M
+
+covid_trend.df %>% #plot for Covid death
+  ggplot(aes(x = Date, color = Deaths)) +
+  geom_col(
+    aes(y = Deaths),
+    alpha = 0.02) +
+  scale_color_gradient(low  ="orange", #indicate intensity of values by color
+                       high = "red",
+                       n.breaks = 5,
+                       labels = c("0", "5K", "10K", "15K", "20K"), 
+                       limits = c(0, 20000)
+                       ) + 
+  geom_smooth(
+    aes(y = new_deaths_smoothed_sum, fill = ""),
+    alpha = 0.8,
+    span = 0.05) +
+  guides(fill = guide_legend(title = "7-day Average")) + #legend
+  labs(
+    x = "Date (Month,Year)",
+    title = "Global Trend of Covid-19 Deaths") +
+  scale_x_date( 
+    date_breaks = "3 month",  
+    date_labels = "%b %y" 
+    ) +
+   theme(axis.text.x = element_text(angle = 45,
+                                    vjust = 1.24,
+                                    hjust = 1.2,
+                                    size  = 10),
+          axis.text.y = element_text(size  = 10)) +
+  scale_y_continuous(labels = scales::label_number_si()) #y-axis in M 
+```
